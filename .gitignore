@@ -1,0 +1,10 @@
+# Dữ liệu cào được: không đưa lên git (DB nhị phân phình to theo mỗi lần cào; CSV gửi riêng)
+data/
+
+# Profile Chrome của batdongsan_scraper.py: chứa cookie phiên, KHÔNG BAO GIỜ đưa lên
+.browser_profile/
+
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/

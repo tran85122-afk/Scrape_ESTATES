@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="__CSRF_TOKEN__"><!-- app.py thay bằng token thật khi trả trang -->
+<title>Mặt bằng cho thuê Hà Nội</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2433; --muted:#6b7385; --line:#e3e6ec; --accent:#2563eb; --ok:#16a34a; --bad:#dc2626; }
+  * { box-sizing:border-box }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text) }
+  header { padding:14px 20px; background:var(--card); border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; flex-wrap:wrap }
+  h1 { font-size:18px; margin:0 auto 0 0 }
+  main { padding:16px 20px; display:grid; gap:16px }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px }
+  .stats { display:flex; gap:24px; flex-wrap:wrap }
+  .stat b { display:block; font-size:22px }
+  .stat span { color:var(--muted); font-size:12px }
+  .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:16px }
+  @media (max-width: 900px) { .grid2 { grid-template-columns:1fr } }
+  .filters { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px }
+  input, select, button { font:inherit; padding:6px 9px; border:1px solid var(--line); border-radius:6px; background:#fff }
+  button { cursor:pointer; background:var(--accent); color:#fff; border-color:var(--accent) }
+  button.ghost { background:#fff; color:var(--text); border-color:var(--line) }
+  table { width:100%; border-collapse:collapse }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top }
+  th { font-size:12px; color:var(--muted); font-weight:600 }
+  tbody tr { cursor:pointer } tbody tr:hover { background:#f0f4ff }
+  .tag { display:inline-block; padding:1px 7px; border-radius:10px; font-size:12px; background:#eef2ff; color:#3730a3 }
+  .off { background:#fee2e2; color:var(--bad) }
+  .muted { color:var(--muted) }
+  #log { background:#0f172a; color:#cbd5e1; font:12px/1.5 ui-monospace,Consolas,monospace; padding:10px; border-radius:6px; height:170px; overflow:auto; white-space:pre-wrap; margin:8px 0 0 }
+  #map { height:420px; border-radius:8px }
+  .pager { display:flex; gap:8px; align-items:center; margin-top:10px }
+  dialog { width:min(900px,95vw); border:none; border-radius:12px; padding:0 }
+  dialog::backdrop { background:rgba(0,0,0,.4) }
+  .dlg-head { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:flex-start }
+  .dlg-head h2 { font-size:16px; margin:0; flex:1 }
+  .dlg-body { padding:14px 18px; display:grid; gap:12px; max-height:75vh; overflow:auto }
+  .kv { display:grid; grid-template-columns:140px 1fr; gap:4px 12px }
+  .kv div:nth-child(odd) { color:var(--muted) }
+  .coord { font-weight:700; color:var(--accent) }
+  #dmap { height:260px; border-radius:8px }
+  .imgs { display:flex; gap:6px; overflow-x:auto } .imgs img { height:110px; border-radius:6px }
+  .desc { white-space:pre-wrap; background:var(--bg); padding:10px; border-radius:6px }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mặt bằng cho thuê Hà Nội <span class="muted" style="font-weight:400;font-size:13px">· nguồn: Chợ Tốt Nhà</span></h1>
+  <div class="stats" id="stats"></div>
+</header>
+<main>
+  <div class="grid2">
+    <div class="card">
+      <b>Tiến trình cào</b> <span id="runstate" class="tag"></span>
+      <button id="runbtn" style="float:right">Chạy ngay</button>
+      <pre id="log"></pre>
+      <div class="muted" id="runs" style="margin-top:8px;font-size:12px"></div>
+    </div>
+    <div class="card">
+      <b>Lịch chạy tự động</b> <span id="schstate" class="tag"></span>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">
+        <label><input type="checkbox" id="schon"> Bật</label>
+        · lúc <input type="time" id="schtime" value="03:00">
+      </div>
+      <div id="schdays" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;align-items:center">
+        <label><input type="checkbox" value="Monday"> T2</label><label><input type="checkbox" value="Tuesday"> T3</label>
+        <label><input type="checkbox" value="Wednesday"> T4</label><label><input type="checkbox" value="Thursday"> T5</label>
+        <label><input type="checkbox" value="Friday"> T6</label><label><input type="checkbox" value="Saturday"> T7</label>
+        <label><input type="checkbox" value="Sunday"> CN</label>
+        <button class="ghost" id="schall" type="button">Hàng ngày</button>
+        <button id="schsave">Lưu lịch</button>
+      </div>
+      <div class="muted" id="schinfo" style="margin-top:10px;font-size:12px"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="filters">
+      <input id="q" placeholder="Tìm tiêu đề, đường, phường…" style="flex:1;min-width:200px">
+      <select id="loai"><option value="">Mọi loại</option></select>
+      <select id="quan"><option value="">Mọi quận/huyện</option></select>
+      <input id="minp" type="number" placeholder="Giá từ (triệu)" style="width:130px">
+      <input id="maxp" type="number" placeholder="đến (triệu)" style="width:110px">
+      <select id="status">
+        <option value="active">Đang đăng</option><option value="">Tất cả</option>
+        <option value="new">Mới ở lần cào gần nhất</option><option value="removed">Đã gỡ / mất</option>
+      </select>
+      <button id="go">Lọc</button>
+      <button class="ghost" id="togglemap">Bản đồ</button>
+    </div>
+    <div id="map" hidden></div>
+    <div class="muted" id="count"></div>
+    <table>
+      <thead><tr><th>Tiêu đề</th><th>Loại</th><th>Giá</th><th>DT (m²)</th><th>Vị trí</th><th>Tọa độ</th><th>Ngày đăng</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="pager"><button class="ghost" id="prev">‹ Trước</button><span id="pageinfo"></span><button class="ghost" id="next">Sau ›</button></div>
+  </div>
+</main>
+
+<dialog id="dlg">
+  <div class="dlg-head"><h2 id="dtitle"></h2><button class="ghost" onclick="dlg.close()">Đóng</button></div>
+  <div class="dlg-body" id="dbody"></div>
+</dialog>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const j = (u, o) => fetch(u, o).then(r => r.json());
+let page = 1, map, markers, dmap;
+// tile.openstreetmap.org chặn request từ localhost, CARTO đòi API key -> dùng tile Esri (không cần key)
+const TILES = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}';
+const ATTR = 'Tiles © Esri';
+
+async function loadStats() {
+  const s = await j('/api/stats');
+  $('stats').innerHTML = `
+    <div class="stat"><b>${s.total ?? 0}</b><span>tổng trong DB</span></div>
+    <div class="stat"><b style="color:var(--ok)">${s.active ?? 0}</b><span>đang đăng</span></div>
+    <div class="stat" title="Tin đã cào trước đây nhưng lần cào gần nhất không còn thấy trên Chợ Tốt (người đăng gỡ / hết hạn). Giữ lại làm lịch sử."><b style="color:var(--bad)">${s.removed ?? 0}</b><span>người đăng đã gỡ</span></div>
+    <div class="stat"><b style="font-size:14px;padding-top:6px">${esc((s.last_seen||'').replace('T',' '))}</b><span>cập nhật gần nhất</span></div>`;
+}
+
+async function loadFilters() {
+  const f = await j('/api/filters');
+  f.loai.forEach(x => $('loai').add(new Option(x, x)));
+  f.quan.forEach(x => $('quan').add(new Option(x, x)));
+}
+
+function params() {
+  const p = new URLSearchParams({ q:$('q').value, loai:$('loai').value, quan:$('quan').value,
+    min_price:$('minp').value, max_price:$('maxp').value, status:$('status').value, page });
+  return p.toString();
+}
+
+async function loadList() {
+  const d = await j('/api/listings?' + params());
+  $('count').textContent = `${d.total} kết quả`;
+  $('rows').innerHTML = d.items.map(x => `
+    <tr data-id="${x.list_id}">
+      <td>${esc(x.tieu_de)} ${x.is_active ? '' : '<span class="tag off">đã gỡ</span>'}</td>
+      <td><span class="tag">${esc(x.loai)}</span></td>
+      <td>${esc(x.gia_text)}</td><td>${x.dien_tich ?? ''}</td>
+      <td>${esc([x.duong, x.phuong, x.quan].filter(Boolean).join(', '))}</td>
+      <td class="muted">${x.lat?.toFixed(5)}, ${x.lng?.toFixed(5)}</td>
+      <td class="muted">${esc((x.ngay_dang||'').slice(0,10))}</td>
+    </tr>`).join('');
+  const pages = Math.max(1, Math.ceil(d.total / d.size));
+  $('pageinfo').textContent = `Trang ${d.page}/${pages}`;
+  $('prev').disabled = d.page <= 1; $('next').disabled = d.page >= pages;
+  if (!$('map').hidden) drawMarkers(d.items);
+}
+
+function drawMarkers(items) {
+  markers.clearLayers();
+  const pts = items.filter(x => x.lat).map(x => {
+    L.circleMarker([x.lat, x.lng], { radius:7, color:'#2563eb' }).addTo(markers)
+      .bindTooltip(`${esc(x.tieu_de)}<br>${esc(x.gia_text)}`).on('click', () => openDetail(x.list_id));
+    return [x.lat, x.lng];
+  });
+  if (pts.length) map.fitBounds(pts, { padding:[20,20], maxZoom:15 });
+}
+
+$('togglemap').onclick = () => {
+  $('map').hidden = !$('map').hidden;
+  if (!map) {
+    map = L.map('map').setView([21.03, 105.82], 12);
+    L.tileLayer(TILES, { attribution: ATTR }).addTo(map);
+    markers = L.layerGroup().addTo(map);
+  }
+  setTimeout(() => { map.invalidateSize(); loadList(); }, 50);
+};
+
+async function openDetail(id) {
+  const d = await j('/api/listing/' + id);
+  $('dtitle').textContent = d.tieu_de;
+  const kv = [
+    ['Tọa độ', `<span class="coord">${d.lat}, ${d.lng}</span> · <a target="_blank" href="https://www.google.com/maps?q=${d.lat},${d.lng}">Google Maps</a>`],
+    ['Giá', esc(d.gia_text)], ['Diện tích', d.dien_tich ? d.dien_tich + ' m²' : ''],
+    ['Loại', esc(d.danh_muc + ' · ' + (d.loai || ''))],
+    ['Địa chỉ', esc([d.duong, d.phuong, d.quan, d.tinh].filter(Boolean).join(', '))],
+    ['Số phòng / tầng / WC', [d.so_phong, d.so_tang, d.so_wc].map(v => v ?? '–').join(' / ')],
+    ['Mặt đường', d.mat_duong == null ? '' : (d.mat_duong ? 'Có' : 'Không')],
+    ['Người đăng', esc(d.nguoi_dang)], ['Ngày đăng', esc((d.ngay_dang||'').replace('T',' '))],
+    ['Lần đầu thấy / gần nhất', esc(`${d.first_seen} / ${d.last_seen}`)],
+    ['Trạng thái', d.is_active ? 'Đang đăng' : `Đã gỡ (${esc(d.removed_at)})`],
+    ['Mã tin', `${d.list_id} · <a target="_blank" href="${esc(d.url)}">Xem tin gốc</a>`],
+  ];
+  $('dbody').innerHTML = `
+    <div class="kv">${kv.map(([k,v]) => `<div>${k}</div><div>${v ?? ''}</div>`).join('')}</div>
+    <div id="dmap"></div>
+    <div class="imgs">${d.anh.map(u => `<img loading="lazy" src="${esc(u)}">`).join('')}</div>
+    <div class="desc">${esc(d.mo_ta)}</div>`;
+  $('dlg').showModal();
+  if (dmap) dmap.remove();
+  dmap = L.map('dmap').setView([d.lat, d.lng], 17);
+  L.tileLayer(TILES, { attribution: ATTR, maxZoom: 19 }).addTo(dmap);
+  L.marker([d.lat, d.lng]).addTo(dmap);
+}
+
+$('rows').onclick = e => { const tr = e.target.closest('tr'); if (tr) openDetail(tr.dataset.id); };
+$('go').onclick = () => { page = 1; loadList(); };
+$('q').onkeydown = e => { if (e.key === 'Enter') $('go').click(); };
+$('prev').onclick = () => { page--; loadList(); };
+$('next').onclick = () => { page++; loadList(); };
+
+let wasRunning = false;
+async function loadLog() {
+  const l = await j('/api/log');
+  $('log').textContent = l.lines.join('\n'); $('log').scrollTop = 1e9;
+  $('runstate').textContent = l.running ? 'đang chạy…' : 'đang nghỉ';
+  $('runbtn').disabled = l.running;
+  if (wasRunning && !l.running) { loadStats(); loadList(); }
+  wasRunning = l.running;
+  const runs = await j('/api/runs');
+  $('runs').innerHTML = 'Các lần chạy gần đây: ' + runs.slice(0, 5).map(r =>
+    `${esc((r.started_at||'').replace('T',' '))} – ${esc(r.status)} (${r.n_found ?? 0} tin, +${r.n_new ?? 0} mới, ${r.n_removed == null ? 'không kiểm tra tin mất' : '−' + r.n_removed + ' mất'})`).join(' · ');
+  // n_removed = NULL: lần chạy thử / lỗi / lấy thiếu tin -> không kiểm tra tin đã gỡ (xem chotot_scraper.py)
+}
+// app.py từ chối POST không phải JSON hoặc thiếu đúng token CSRF (token lấy từ thẻ <meta> do app.py nhúng vào)
+const JSON_HDR = {
+  'Content-Type': 'application/json',
+  'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]').content,
+};
+$('runbtn').onclick = async () => { await j('/api/run', { method:'POST', headers: JSON_HDR, body:'{}' }); loadLog(); };
+
+const dayBoxes = () => [...document.querySelectorAll('#schdays input[type=checkbox]')];
+$('schall').onclick = () => dayBoxes().forEach(c => c.checked = true);
+
+async function loadSchedule() {
+  const s = await j('/api/schedule');
+  if (s.error) { $('schinfo').textContent = 'Lỗi: ' + s.error; return; }
+  if (!s.exists) { $('schstate').textContent = 'chưa tạo'; $('schinfo').textContent = 'Chọn ngày giờ rồi bấm "Lưu lịch" để tạo lịch trong Windows Task Scheduler.'; return; }
+  $('schon').checked = s.enabled; $('schtime').value = s.time;
+  dayBoxes().forEach(c => c.checked = s.days.includes(c.value));
+  $('schstate').textContent = s.enabled ? 'đang bật' : 'đang tắt';
+  $('schstate').className = 'tag' + (s.enabled ? '' : ' off');
+  const last = !s.last || s.last.includes('1999') ? 'chưa chạy' : s.last;  // Windows trả 1999 khi chưa chạy lần nào
+  $('schinfo').textContent = `Lần chạy trước: ${last} · Lần chạy tới: ${s.enabled ? (s.next || '–') : '(đang tắt)'}`;
+}
+$('schsave').onclick = async () => {
+  const days = dayBoxes().filter(c => c.checked).map(c => c.value);
+  if (!days.length) { alert('Chọn ít nhất 1 ngày'); return; }
+  const s = await j('/api/schedule', { method:'POST', headers: JSON_HDR, body: JSON.stringify({ days, time:$('schtime').value, enabled:$('schon').checked }) });
+  if (s.error) alert('Lỗi: ' + s.error);
+  loadSchedule();
+};
+
+loadStats(); loadFilters(); loadList(); loadLog(); loadSchedule();
+setInterval(loadLog, 3000);
+</script>
+</body>
+</html>
