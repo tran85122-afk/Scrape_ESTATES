@@ -14,9 +14,10 @@ import csv
 import json
 import os
 import random
-import sqlite3
 import time
 from datetime import datetime
+
+from db import init_db, jsonb
 
 try:
     from playwright.sync_api import sync_playwright
@@ -30,8 +31,7 @@ CATEGORIES = {
     "van-phong": "/cho-thue-van-phong-tp-ha-noi",
 }
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(HERE, "data")
-DB_PATH = os.path.join(DATA_DIR, "bds.sqlite")
+DATA_DIR = os.path.join(HERE, "data")  # log + bản xuất CSV (dữ liệu chính nằm trong PostgreSQL, xem db.py)
 PROFILE_DIR = os.path.join(HERE, ".browser_profile")  # giữ cookie Cloudflare giữa các lần chạy
 
 LIST_JS = """() => [...new Set([...document.querySelectorAll('a.js__product-link-for-product-id')]
@@ -72,24 +72,6 @@ def log(msg):
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(os.path.join(DATA_DIR, "scrape.log"), "a", encoding="utf-8") as f:
         f.write(line + "\n")
-
-
-def init_db():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    db = sqlite3.connect(DB_PATH)
-    db.executescript("""
-    CREATE TABLE IF NOT EXISTS listings (
-        ma_tin TEXT PRIMARY KEY, danh_muc TEXT, url TEXT, tieu_de TEXT, dia_chi TEXT,
-        lat REAL, lng REAL, gia TEXT, dien_tich TEXT, thong_so TEXT,
-        ngay_dang TEXT, ngay_het_han TEXT, loai_tin TEXT, mo_ta TEXT, anh TEXT, lien_he TEXT,
-        first_seen TEXT, last_seen TEXT, is_active INTEGER DEFAULT 1, removed_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT, finished_at TEXT, status TEXT,
-        n_found INTEGER, n_new INTEGER, n_removed INTEGER, n_errors INTEGER
-    );
-    """)
-    return db
 
 
 def safe_eval(page, js, tries=10):
@@ -188,8 +170,10 @@ def main():
     if sync_playwright is None:
         raise SystemExit("Thiếu thư viện playwright: chạy  pip install -r requirements.txt  trong thư mục chứa code")
 
-    now = datetime.now().isoformat(timespec="seconds")
-    run_id = db.execute("INSERT INTO runs(started_at, status) VALUES (?, 'running')", (now,)).lastrowid
+    now = datetime.now().replace(microsecond=0)
+    run_id = db.execute(
+        "INSERT INTO batdongsan_runs (started_at, status) VALUES (%s, 'running') RETURNING id", (now,)
+    ).fetchone()[0]
     db.commit()
     n_new = n_err = 0
     seen_ids = []
@@ -229,15 +213,15 @@ def main():
                         pause(args)  # vẫn phải nghỉ: trang này đã được tải, bỏ qua mà không nghỉ dễ bị chặn
                         continue
                     seen_ids.append(ma_tin)
-                    ts = datetime.now().isoformat(timespec="seconds")
-                    existed = db.execute("SELECT 1 FROM listings WHERE ma_tin=?", (ma_tin,)).fetchone()
+                    ts = datetime.now().replace(microsecond=0)
+                    existed = db.execute("SELECT 1 FROM batdongsan_listings WHERE ma_tin = %s", (ma_tin,)).fetchone()
                     n_new += not existed
                     db.execute(
                         """
-                    INSERT INTO listings(ma_tin, danh_muc, url, tieu_de, dia_chi, lat, lng, gia, dien_tich,
-                        thong_so, ngay_dang, ngay_het_han, loai_tin, mo_ta, anh, lien_he,
+                    INSERT INTO batdongsan_listings(ma_tin, danh_muc, url, tieu_de, dia_chi, lat, lng, gia,
+                        dien_tich, thong_so, ngay_dang, ngay_het_han, loai_tin, mo_ta, anh, lien_he,
                         first_seen, last_seen, is_active, removed_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,NULL)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,NULL)
                     ON CONFLICT(ma_tin) DO UPDATE SET danh_muc=excluded.danh_muc, url=excluded.url,
                         tieu_de=excluded.tieu_de, dia_chi=excluded.dia_chi, lat=excluded.lat, lng=excluded.lng,
                         gia=excluded.gia, dien_tich=excluded.dien_tich, thong_so=excluded.thong_so,
@@ -255,12 +239,12 @@ def main():
                             d["lng"],
                             d["thong_so"].get("Khoảng giá") or d["thong_so"].get("Mức giá"),
                             d["thong_so"].get("Diện tích"),
-                            json.dumps(d["thong_so"], ensure_ascii=False),
+                            jsonb(d["thong_so"]),
                             cfg.get("Ngày đăng"),
                             cfg.get("Ngày hết hạn"),
                             cfg.get("Loại tin"),
                             d["mo_ta"],
-                            json.dumps(d["anh"], ensure_ascii=False),
+                            jsonb(d["anh"]),
                             d["lien_he"],
                             ts,
                             ts,
@@ -271,11 +255,13 @@ def main():
                 except BlockedError:
                     raise  # bị chặn -> dừng cả lần chạy, không gửi thêm request
                 except Exception as e:  # lỗi 1 tin không làm hỏng cả lần chạy
+                    db.rollback()  # PostgreSQL khóa giao dịch sau lỗi; rollback để các tin sau vẫn ghi được
                     n_err += 1
                     log(f"[{i}/{len(links)}] LỖI {url}: {e}")
                 pause(args)
             status = "done"
         except Exception as e:
+            db.rollback()  # bỏ phần ghi dở dang; các tin đã commit trước đó vẫn còn
             status = f"failed: {e}"
             log(status)
         finally:
@@ -285,29 +271,42 @@ def main():
     # Chỉ đánh dấu tin "đã mất" khi chạy trọn vẹn (không phải chạy thử, không lỗi giữa chừng)
     n_removed = 0
     if status == "done" and not args.limit and seen_ids:
-        ts = datetime.now().isoformat(timespec="seconds")
-        marks = ",".join("?" * len(seen_ids))
+        ts = datetime.now().replace(microsecond=0)
         n_removed = db.execute(
-            f"UPDATE listings SET is_active=0, removed_at=? WHERE is_active=1 AND ma_tin NOT IN ({marks})",
-            [ts, *seen_ids],
+            "UPDATE batdongsan_listings SET is_active = 0, removed_at = %s "
+            "WHERE is_active = 1 AND NOT (ma_tin = ANY(%s))",
+            (ts, seen_ids),
         ).rowcount
     db.execute(
-        "UPDATE runs SET finished_at=?, status=?, n_found=?, n_new=?, n_removed=?, n_errors=? WHERE id=?",
-        (datetime.now().isoformat(timespec="seconds"), status, len(seen_ids), n_new, n_removed, n_err, run_id),
+        "UPDATE batdongsan_runs SET finished_at = %s, status = %s, n_found = %s, n_new = %s, n_removed = %s, "
+        "n_errors = %s WHERE id = %s",
+        (datetime.now().replace(microsecond=0), status, len(seen_ids), n_new, n_removed, n_err, run_id),
     )
     db.commit()
     log(f"Xong: {status} | tìm thấy {len(seen_ids)} | mới {n_new} | đã mất {n_removed} | lỗi {n_err}")
     export_csv(db)
+    db.close()
 
 
 def export_csv(db):
     path = os.path.join(DATA_DIR, "listings.csv")
-    cur = db.execute("SELECT * FROM listings ORDER BY is_active DESC, danh_muc, ma_tin")
-    cols = [c[0] for c in cur.description]
+    os.makedirs(DATA_DIR, exist_ok=True)
+    cur = db.execute("SELECT * FROM batdongsan_listings ORDER BY is_active DESC, danh_muc, ma_tin")
+    cols = [c.name for c in cur.description]
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
-        w.writerows(cur)
+        for rec in cur:
+            w.writerow(
+                [
+                    v.isoformat(timespec="seconds")
+                    if isinstance(v, datetime)
+                    else json.dumps(v, ensure_ascii=False)
+                    if isinstance(v, (list, dict))
+                    else v
+                    for v in rec
+                ]
+            )
     log(f"Đã xuất {path}")
 
 

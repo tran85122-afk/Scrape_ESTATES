@@ -57,6 +57,28 @@
     <div class="card">
       <b>Tiến trình cào</b> <span id="runstate" class="tag"></span>
       <button id="runbtn" style="float:right">Chạy ngay</button>
+      <details id="runopts" style="margin-top:10px">
+        <summary>Giới hạn lọc / giới hạn cào cho lần "Chạy ngay" <span class="muted">(để trống = cào hết)</span></summary>
+        <div style="display:grid;gap:8px;margin-top:8px">
+          <div id="ro_loai" style="display:flex;gap:10px;flex-wrap:wrap">Loại:
+            <label><input type="checkbox" value="mat-pho"> Mặt phố</label>
+            <label><input type="checkbox" value="lien-ke"> Liền kề</label>
+            <label><input type="checkbox" value="van-phong"> Văn phòng</label>
+            <label><input type="checkbox" value="mat-bang"> Mặt bằng KD</label>
+            <label><input type="checkbox" value="shophouse"> Shophouse</label>
+            <label><input type="checkbox" value="officetel"> Officetel</label>
+          </div>
+          <input id="ro_quan" placeholder="Quận/huyện, cách nhau bằng dấu phẩy (vd: Cầu Giấy, Đống Đa)">
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <input id="ro_gia_min" type="number" min="0" placeholder="Giá từ (triệu)" style="width:120px">
+            <input id="ro_gia_max" type="number" min="0" placeholder="Giá đến (triệu)" style="width:120px">
+            <input id="ro_dt_min" type="number" min="0" placeholder="DT từ (m²)" style="width:110px">
+            <input id="ro_dt_max" type="number" min="0" placeholder="DT đến (m²)" style="width:110px">
+            <input id="ro_max_tin" type="number" min="1" placeholder="Tối đa N tin" style="width:120px">
+          </div>
+          <div class="muted" style="font-size:12px">Có lọc/giới hạn thì lần chạy chỉ lấy một phần tin, nên <b>không</b> đánh dấu tin nào là "đã gỡ". Lịch tự động luôn cào đầy đủ.</div>
+        </div>
+      </details>
       <pre id="log"></pre>
       <div class="muted" id="runs" style="margin-top:8px;font-size:12px"></div>
     </div>
@@ -190,11 +212,22 @@ async function openDetail(id) {
     ['Trạng thái', d.is_active ? 'Đang đăng' : `Đã gỡ (${esc(d.removed_at)})`],
     ['Mã tin', `${d.list_id} · <a target="_blank" href="${esc(d.url)}">Xem tin gốc</a>`],
   ];
+  // Lịch sử (bảng chotot_history): tin xuất hiện / thay đổi / bị gỡ / đăng lại vào lúc nào
+  const EVENT = { moi: 'Xuất hiện', thay_doi: 'Thay đổi', go: 'Bị gỡ', dang_lai: 'Đăng lại' };
+  const fmt = v => typeof v === 'number' && v > 1e5 ? (v / 1e6).toLocaleString('vi') + ' tr' : String(v ?? '–');
+  const histRows = (d.lich_su || []).map(h => `<tr>
+      <td>${esc((h.at || '').replace('T', ' '))}</td><td>${EVENT[h.su_kien] || esc(h.su_kien)}</td>
+      <td>${esc(h.gia_text)}</td><td>${h.dien_tich ?? ''}</td>
+      <td>${h.thay_doi ? Object.entries(h.thay_doi).map(([c, [a, b]]) =>
+        `${esc(c)}: ${esc(c === 'mo_ta' ? '(đổi mô tả)' : fmt(a) + ' → ' + fmt(b))}`).join('<br>') : ''}</td></tr>`).join('');
   $('dbody').innerHTML = `
     <div class="kv">${kv.map(([k,v]) => `<div>${k}</div><div>${v ?? ''}</div>`).join('')}</div>
     <div id="dmap"></div>
     <div class="imgs">${d.anh.map(u => `<img loading="lazy" src="${esc(u)}">`).join('')}</div>
-    <div class="desc">${esc(d.mo_ta)}</div>`;
+    <div class="desc">${esc(d.mo_ta)}</div>
+    <div><b>Lịch sử thay đổi</b>
+      <table><thead><tr><th>Thời điểm</th><th>Sự kiện</th><th>Giá</th><th>DT (m²)</th><th>Chi tiết</th></tr></thead>
+      <tbody>${histRows || '<tr><td colspan="5" class="muted">Chưa có</td></tr>'}</tbody></table></div>`;
   $('dlg').showModal();
   if (dmap) dmap.remove();
   dmap = L.map('dmap').setView([d.lat, d.lng], 17);
@@ -226,7 +259,24 @@ const JSON_HDR = {
   'Content-Type': 'application/json',
   'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]').content,
 };
-$('runbtn').onclick = async () => { await j('/api/run', { method:'POST', headers: JSON_HDR, body:'{}' }); loadLog(); };
+// Gom các ô "Giới hạn lọc / giới hạn cào"; ô để trống thì không gửi
+function runOptions() {
+  const o = {
+    loai: [...document.querySelectorAll('#ro_loai input:checked')].map(c => c.value),
+    quan: $('ro_quan').value.split(',').map(s => s.trim()).filter(Boolean),
+  };
+  for (const k of ['gia_min', 'gia_max', 'dt_min', 'dt_max', 'max_tin']) {
+    const v = $('ro_' + k).value.trim();
+    if (v) o[k] = Number(v);
+  }
+  return o;
+}
+$('runbtn').onclick = async () => {
+  const r = await j('/api/run', { method:'POST', headers: JSON_HDR, body: JSON.stringify(runOptions()) });
+  if (r.error) alert('Lỗi: ' + r.error);
+  else if (r.ok === false) alert(r.msg);
+  loadLog();
+};
 
 const dayBoxes = () => [...document.querySelectorAll('#schdays input[type=checkbox]')];
 $('schall').onclick = () => dayBoxes().forEach(c => c.checked = true);

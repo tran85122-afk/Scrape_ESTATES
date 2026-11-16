@@ -8,13 +8,16 @@ import json
 import os
 import re
 import secrets
-import sqlite3
 import subprocess
 import sys
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from chotot_scraper import init_db
+from psycopg.rows import dict_row
+
+from chotot_scraper import TYPES
+from db import init_db
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(HERE, "data", "scrape.log")
@@ -29,9 +32,15 @@ CSRF_TOKEN = secrets.token_urlsafe(32)
 
 
 def db():
-    con = init_db()  # tạo data/ và các bảng nếu chưa cào lần nào -> giao diện hiện 0 tin thay vì lỗi 500
-    con.row_factory = sqlite3.Row
-    return con
+    """Kết nối PostgreSQL; mỗi dòng trả về dạng dict. init_db tạo bảng nếu chưa cào lần nào -> 0 tin thay vì lỗi."""
+    return init_db(row_factory=dict_row)
+
+
+def to_json(value):
+    """json.dumps không tự đổi được datetime -> đổi sang chuỗi ISO giống trước đây ('2026-11-15T11:07:53')."""
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds")
+    raise TypeError(f"Không đổi được {type(value).__name__} sang JSON")
 
 
 def ps(cmd, env=None):
@@ -107,32 +116,104 @@ def running():
     return _proc is not None and _proc.poll() is None
 
 
+def run_args(body):
+    """Đổi tùy chọn từ giao diện (JSON) thành tham số dòng lệnh cho chotot_scraper.py.
+
+    Mọi giá trị đều được kiểm tra chặt. Kết quả là DANH SÁCH tham số truyền thẳng cho subprocess (không qua shell),
+    nên chữ người dùng nhập (vd tên quận) chỉ là dữ liệu, không thể thành lệnh. Body rỗng {} = cào đầy đủ.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("Dữ liệu gửi lên phải là một object JSON")
+    cli = []
+    loai = body.get("loai") or []
+    if not isinstance(loai, list) or any(t not in TYPES for t in loai):
+        raise ValueError(f"loai phải nằm trong {list(TYPES)}")
+    if loai:
+        cli += ["--loai", *loai]
+    quan = body.get("quan") or []
+    if not isinstance(quan, list) or len(quan) > 20 or any(not isinstance(x, str) or len(x) > 50 for x in quan):
+        raise ValueError("quan phải là danh sách tên quận (tối đa 20, mỗi tên ≤ 50 ký tự)")
+    quan = [x.strip() for x in quan if x.strip()]
+    if quan:
+        cli += ["--quan", *quan]
+    for key, flag in (
+        ("gia_min", "--gia-min"),
+        ("gia_max", "--gia-max"),
+        ("dt_min", "--dt-min"),
+        ("dt_max", "--dt-max"),
+    ):
+        v = body.get(key)
+        if v not in (None, ""):
+            v = float(v)  # chữ không phải số -> ValueError -> 400
+            if not 0 <= v < 1e7:
+                raise ValueError(f"{key} phải là số không âm")
+            cli += [flag, str(v)]
+    for key, flag in (("max_tin", "--max-tin"), ("pages", "--pages")):
+        v = body.get(key)
+        if v not in (None, ""):
+            if isinstance(v, float) and not v.is_integer():  # int(2.5) sẽ lặng lẽ thành 2 -> phải báo lỗi
+                raise ValueError(f"{key} phải là số nguyên")
+            v = int(v)
+            if not 1 <= v <= 100_000:
+                raise ValueError(f"{key} phải là số nguyên dương")
+            cli += [flag, str(v)]
+    return cli
+
+
 def api(path, q, body):
+    """Định tuyến API. Đường dẫn cần dữ liệu thì mở kết nối PostgreSQL (tự đóng khi xong)."""
     global _proc
-    con = db()
+    if path == "/api/run":
+        if body is None:  # chỉ chạy khi POST, không chạy khi chỉ mở link (GET)
+            return None
+        cli = run_args(body)  # kiểm tra tùy chọn TRƯỚC khi chạy; sai thì ValueError -> 400
+        if running():
+            return {"ok": False, "msg": "Đang chạy rồi"}
+        _proc = subprocess.Popen(
+            [sys.executable, SCRAPER, *cli],
+            cwd=HERE,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return {"ok": True}
+    if path == "/api/schedule":
+        if body is None:
+            return get_schedule()
+        return set_schedule(body["days"], body["time"], bool(body["enabled"]))
+    if path in ("/api/stats", "/api/filters", "/api/listings", "/api/runs", "/api/log") or path.startswith(
+        "/api/listing/"
+    ):
+        with db() as con:  # `with` tự đóng kết nối
+            return query_api(con, path, q)
+    return None
+
+
+def query_api(con, path, q):
+    """Các API đọc dữ liệu từ PostgreSQL. Mỗi dòng trả về là dict (row_factory=dict_row)."""
     if path == "/api/stats":
-        r = con.execute("""SELECT COUNT(*) total, SUM(is_active) active, SUM(1-is_active) removed,
-                           MAX(last_seen) last_seen FROM chotot_listings""").fetchone()
-        by = con.execute("""SELECT loai, COUNT(*) n FROM chotot_listings WHERE is_active=1
+        r = con.execute("""SELECT COUNT(*) AS total, SUM(is_active) AS active, SUM(1 - is_active) AS removed,
+                           MAX(last_seen) AS last_seen FROM chotot_listings""").fetchone()
+        by = con.execute("""SELECT loai, COUNT(*) AS n FROM chotot_listings WHERE is_active = 1
                             GROUP BY loai ORDER BY n DESC""").fetchall()
-        return {**dict(r), "by_type": [dict(x) for x in by]}
+        return {**r, "by_type": by}
     if path == "/api/filters":
         return {
-            "loai": [x[0] for x in con.execute("SELECT DISTINCT loai FROM chotot_listings ORDER BY 1")],
-            "quan": [x[0] for x in con.execute("SELECT DISTINCT quan FROM chotot_listings ORDER BY 1")],
+            "loai": [x["loai"] for x in con.execute("SELECT DISTINCT loai FROM chotot_listings ORDER BY 1")],
+            "quan": [x["quan"] for x in con.execute("SELECT DISTINCT quan FROM chotot_listings ORDER BY 1")],
         }
     if path == "/api/listings":
-        where, args = ["1=1"], []
+        where, args = ["TRUE"], []
 
         def g(k):  # lấy giá trị tham số k trên URL, không có thì ""
             return (q.get(k) or [""])[0]
 
-        if g("q"):
-            where.append("(tieu_de LIKE ? OR duong LIKE ? OR phuong LIKE ? OR mo_ta LIKE ?)")
+        if g("q"):  # ILIKE = LIKE không phân biệt hoa/thường
+            where.append("(tieu_de ILIKE %s OR duong ILIKE %s OR phuong ILIKE %s OR mo_ta ILIKE %s)")
             args += [f"%{g('q')}%"] * 4
         for k in ("loai", "quan"):
             if g(k):
-                where.append(f"{k} = ?")
+                where.append(f"{k} = %s")
                 args.append(g(k))
         if g("status") == "active":
             where.append("is_active = 1")
@@ -145,64 +226,53 @@ def api(path, q, body):
                 "AND n_removed IS NOT NULL ORDER BY id DESC LIMIT 1)"
             )
         if g("min_price"):
-            where.append("gia >= ?")
+            where.append("gia >= %s")
             args.append(float(g("min_price")) * 1e6)
         if g("max_price"):
-            where.append("gia <= ?")
+            where.append("gia <= %s")
             args.append(float(g("max_price")) * 1e6)
         w = " AND ".join(where)
         page, size = max(1, int(g("page") or 1)), 50
-        total = con.execute(f"SELECT COUNT(*) FROM chotot_listings WHERE {w}", args).fetchone()[0]
+        total = con.execute(f"SELECT COUNT(*) AS n FROM chotot_listings WHERE {w}", args).fetchone()["n"]
         rows = con.execute(
             f"""SELECT list_id, tieu_de, loai, gia, gia_text, dien_tich, duong, phuong, quan,
-                               lat, lng, ngay_dang, is_active FROM chotot_listings WHERE {w}
-                               ORDER BY ngay_dang DESC LIMIT ? OFFSET ?""",
+                       lat, lng, ngay_dang, is_active FROM chotot_listings WHERE {w}
+                ORDER BY ngay_dang DESC NULLS LAST, list_id LIMIT %s OFFSET %s""",
             [*args, size, (page - 1) * size],
         ).fetchall()
-        return {"total": total, "page": page, "size": size, "items": [dict(r) for r in rows]}
+        return {"total": total, "page": page, "size": size, "items": rows}
     if path.startswith("/api/listing/"):
-        r = con.execute("SELECT * FROM chotot_listings WHERE list_id=?", (int(path.rsplit("/", 1)[1]),)).fetchone()
-        if not r:
+        list_id = int(path.rsplit("/", 1)[1])
+        d = con.execute("SELECT * FROM chotot_listings WHERE list_id = %s", (list_id,)).fetchone()
+        if not d:
             return None
-        d = dict(r)
-        d["anh"] = json.loads(d["anh"] or "[]")
         d.pop("raw", None)
+        # Lịch sử để truy ngược: tin xuất hiện, đổi giá/nội dung, bị gỡ, đăng lại vào lúc nào (mới nhất trước)
+        d["lich_su"] = con.execute(
+            """SELECT at, su_kien, run_id, gia, gia_text, dien_tich, tieu_de, thay_doi
+               FROM chotot_history WHERE list_id = %s ORDER BY at DESC, id DESC""",
+            (list_id,),
+        ).fetchall()
         return d
     if path == "/api/runs":
-        return [dict(r) for r in con.execute("SELECT * FROM chotot_runs ORDER BY id DESC LIMIT 20")]
+        return con.execute("SELECT * FROM chotot_runs ORDER BY id DESC LIMIT 20").fetchall()
     if path == "/api/log":
         lines = []
         if os.path.exists(LOG_PATH):
             with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
                 lines = [line for line in f.read().splitlines() if "[chotot]" in line][-30:]
         # lần chạy do Task Scheduler khởi động (không phải từ nút bấm); bỏ qua bản ghi treo quá 1 giờ
-        sql_running = """SELECT COUNT(*) FROM chotot_runs WHERE status='running'
-                         AND replace(started_at,'T',' ') > datetime('now','localtime','-1 hour')"""
-        db_running = con.execute(sql_running).fetchone()[0]
+        db_running = con.execute(
+            """SELECT COUNT(*) AS n FROM chotot_runs WHERE status = 'running'
+               AND started_at > LOCALTIMESTAMP - INTERVAL '1 hour'"""
+        ).fetchone()["n"]
         return {"running": running() or bool(db_running), "lines": lines}
-    if path == "/api/run":
-        if body is None:  # chỉ chạy khi POST, không chạy khi chỉ mở link (GET)
-            return None
-        if running():
-            return {"ok": False, "msg": "Đang chạy rồi"}
-        _proc = subprocess.Popen(
-            [sys.executable, SCRAPER],
-            cwd=HERE,
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return {"ok": True}
-    if path == "/api/schedule":
-        if body is None:
-            return get_schedule()
-        return set_schedule(body["days"], body["time"], bool(body["enabled"]))
     return None
 
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, data, ctype="application/json; charset=utf-8"):
-        raw = data if isinstance(data, bytes) else json.dumps(data, ensure_ascii=False).encode("utf-8")
+        raw = data if isinstance(data, bytes) else json.dumps(data, ensure_ascii=False, default=to_json).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))

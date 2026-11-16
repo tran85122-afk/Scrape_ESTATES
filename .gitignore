@@ -4,6 +4,9 @@ data/
 # Profile Chrome của batdongsan_scraper.py: chứa cookie phiên, KHÔNG BAO GIỜ đưa lên
 .browser_profile/
 
+# Mật khẩu PostgreSQL: KHÔNG BAO GIỜ đưa lên (mẫu nằm ở .env.example)
+.env
+
 __pycache__/
 *.pyc
 .ruff_cache/

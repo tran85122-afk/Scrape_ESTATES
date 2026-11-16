@@ -1,24 +1,70 @@
 # Cào tin cho thuê mặt bằng kinh doanh tại Hà Nội
 
-Công cụ tự động lấy tin **cho thuê để kinh doanh** tại Hà Nội (nhà mặt phố, liền kề, văn phòng, mặt bằng kinh doanh, shophouse, officetel), kèm **tọa độ**, giá, diện tích và mô tả. Dữ liệu lưu vào SQLite, có giao diện web để xem và lịch chạy tự động.
+Công cụ tự động lấy tin **cho thuê để kinh doanh** tại Hà Nội (nhà mặt phố, liền kề, văn phòng, mặt bằng kinh doanh, shophouse, officetel), kèm **tọa độ**, giá, diện tích và mô tả. Dữ liệu lưu vào **PostgreSQL**, có **lịch sử thay đổi** của từng tin để truy ngược, giao diện web để xem và lịch chạy tự động.
 
 Phương pháp kéo dữ liệu và các hàm cần chạy: xem **[PHUONG_PHAP_KEO_DU_LIEU.md](PHUONG_PHAP_KEO_DU_LIEU.md)**.
 
-## Bắt đầu nhanh
+## Cài đặt
 
-Yêu cầu: Python 3.10 trở lên. Không cần cài thêm thư viện.
+Yêu cầu: Python 3.10 trở lên, PostgreSQL (máy đang dùng PostgreSQL 16, cổng **5433**).
+
+**1. Cài thư viện**
+```
+pip install -r requirements.txt
+```
+
+**2. Tạo user và database PostgreSQL** (một lần; mở psql bằng tài khoản `postgres`):
+```
+"C:\Program Files\PostgreSQL\16\bin\psql.exe" -h localhost -p 5433 -U postgres
+```
+```sql
+CREATE ROLE scraper LOGIN PASSWORD 'mật-khẩu-của-bạn';
+CREATE DATABASE bds OWNER scraper;        -- dữ liệu thật
+CREATE DATABASE bds_test OWNER scraper;   -- (không bắt buộc) chỉ dùng khi chạy bộ test
+```
+
+**3. Tạo file `.env`** cạnh code (chép từ `.env.example`, thay mật khẩu). File này nằm trong `.gitignore`, **không bao giờ** đưa lên git:
+```
+DATABASE_URL=postgresql://scraper:mật-khẩu-của-bạn@localhost:5433/bds
+TEST_DATABASE_URL=postgresql://scraper:mật-khẩu-của-bạn@localhost:5433/bds_test
+```
+Bảng được tạo tự động ở lần chạy đầu tiên.
+
+**4. (Chỉ khi có dữ liệu SQLite cũ)** chuyển sang PostgreSQL, chạy một lần (chạy lại cũng không bị trùng):
+```
+python migrate_sqlite_to_pg.py
+```
+
+## Bắt đầu nhanh
 
 ```
 cd Scrape_ESTATES     # thư mục gốc của repo
 python chotot_scraper.py --pages 1    # chạy thử: 50 tin mỗi nhóm, ~30 giây
 python chotot_scraper.py              # cào toàn bộ: ~1.200 tin, ~4–5 phút
+python chotot_scraper.py --loai van-phong --quan "Cầu Giấy" --gia-max 30 --max-tin 100   # có lọc + giới hạn
 python app.py                         # giao diện: mở http://127.0.0.1:8000
 ```
 
-Kết quả nằm trong `data/` (thư mục này không đưa lên git):
-- `data/bds.sqlite`: bảng `chotot_listings` (một dòng/tin) và bảng `chotot_runs` (lịch sử các lần chạy).
-- `data/chotot_listings.csv`: cùng dữ liệu, mở được bằng Excel hoặc pandas.
-- `data/scrape.log`: log của mọi lần chạy.
+Dữ liệu nằm trong PostgreSQL (database `bds`):
+| Bảng | Nội dung |
+|---|---|
+| `chotot_listings` | Trạng thái **mới nhất** của mỗi tin (một dòng/tin), có `first_seen`, `last_seen`, `is_active`, `removed_at` |
+| `chotot_history` | **Lịch sử**: mỗi khi tin xuất hiện (`moi`), thay đổi (`thay_doi`, kèm cột nào đổi từ gì sang gì), bị gỡ (`go`) hoặc đăng lại (`dang_lai`) |
+| `chotot_runs` | Mỗi lần cào: thời gian, kết quả, số tin mới/gỡ, **tùy chọn đã dùng** (`params`) |
+| `batdongsan_listings`, `batdongsan_runs` | Của bản dự phòng batdongsan |
+
+Ngoài ra thư mục `data/` (không đưa lên git) có `chotot_listings.csv` (bản xuất để mở bằng Excel) và `scrape.log`.
+
+Ví dụ truy ngược bằng SQL:
+```sql
+-- Tin 135798286 đã thay đổi những gì, khi nào?
+SELECT at, su_kien, gia_text, thay_doi FROM chotot_history WHERE list_id = 135798286 ORDER BY at;
+-- Giá của mọi tin văn phòng tại ngày 20/11/2026 (bản ghi gần nhất trước ngày đó)
+SELECT DISTINCT ON (h.list_id) h.list_id, h.gia, h.at
+FROM chotot_history h JOIN chotot_listings l USING (list_id)
+WHERE l.loai = 'Văn phòng' AND h.at < '2026-11-21' AND h.su_kien <> 'go'
+ORDER BY h.list_id, h.at DESC;
+```
 
 ---
 
@@ -71,11 +117,11 @@ Một số trường quan trọng trong mỗi tin (`ads[i]`): `list_id` (mã tin
 
 1. Với từng truy vấn trong `QUERIES`, gọi API với `o = 0, 50, 100, …` cho tới khi một trang trả về ít hơn 50 tin.
 2. Giữa hai request nghỉ **ngẫu nhiên 6–12 giây**. Nếu gặp HTTP 429 hoặc 5xx thì nghỉ 2–4 phút rồi thử lại.
-3. Mỗi tin được **upsert** (thêm mới hoặc cập nhật) vào `chotot_listings` theo `list_id`.
+3. Mỗi tin được **upsert** (thêm mới hoặc cập nhật) vào `chotot_listings` theo `list_id`. Trước khi ghi, so với bản cũ: tin mới, đổi giá/diện tích/tiêu đề/mô tả…, hoặc đăng lại thì ghi thêm một dòng vào `chotot_history`.
 4. Theo dõi thay đổi:
    - Tin chưa có trong DB → ghi `first_seen` (đây là **tin mới**).
    - Tin đã có → cập nhật nội dung và `last_seen`.
-   - Tin trong DB nhưng lần này không thấy → `is_active = 0`, ghi `removed_at` (**tin đã gỡ**). Bước này chỉ chạy khi lần cào hoàn tất trọn vẹn, để một lần lỗi giữa chừng không đánh dấu nhầm.
+   - Tin trong DB nhưng lần này không thấy → `is_active = 0`, ghi `removed_at` và một dòng `go` vào lịch sử (**tin đã gỡ**). Bước này chỉ chạy khi lần cào hoàn tất trọn vẹn và không có lọc/giới hạn, để không đánh dấu nhầm.
 5. Ghi một dòng vào `chotot_runs` (số tin, số tin mới, số tin đã gỡ) và xuất lại CSV.
 
 ### 4. Lưu ý để không bị chặn
@@ -92,8 +138,8 @@ Một số trường quan trọng trong mỗi tin (`ads[i]`): `list_id` (mã tin
 `python app.py` rồi mở http://127.0.0.1:8000:
 - Thống kê: tổng trong DB, đang đăng, người đăng đã gỡ.
 - Lọc theo từ khóa, loại, quận, khoảng giá, trạng thái (đang đăng / mới ở lần cào gần nhất / đã gỡ). Có bản đồ tổng quan.
-- Bấm vào một tin để xem chi tiết: **tọa độ** (kèm link Google Maps), bản đồ, ảnh, mô tả, link gốc.
-- **Chạy ngay**: cào ngay và xem log trực tiếp. Xong thì bảng tự làm mới.
+- Bấm vào một tin để xem chi tiết: **tọa độ** (kèm link Google Maps), bản đồ, ảnh, mô tả, link gốc, và bảng **Lịch sử thay đổi**.
+- **Chạy ngay**: cào ngay và xem log trực tiếp. Xong thì bảng tự làm mới. Mở mục **"Giới hạn lọc / giới hạn cào"** để chọn loại, quận, khoảng giá, khoảng diện tích, số tin tối đa cho lần chạy đó (để trống = cào hết).
 - **Lịch chạy tự động**: tích các ngày trong tuần (hoặc "Hàng ngày") và chọn giờ. Lịch được lưu vào **Windows Task Scheduler** (task `BDS_Chotot_Weekly`), nên vẫn chạy khi giao diện đang tắt, miễn là đã đăng nhập Windows. Nếu đến giờ mà máy tắt, task sẽ chạy bù khi bật máy.
 
 Phần lịch chỉ hoạt động trên Windows. Trên macOS/Linux, dùng cron để chạy `python chotot_scraper.py`.
@@ -105,7 +151,7 @@ Phần lịch chỉ hoạt động trên Windows. Trên macOS/Linux, dùng cron 
 Chỉ dùng khi thật sự cần dữ liệu từ batdongsan.
 
 ```
-pip install -r requirements.txt     # playwright
+pip install -r requirements.txt     # có playwright
 python batdongsan_scraper.py --limit 3         # chạy thử 3 tin
 python batdongsan_scraper.py                   # cào toàn bộ: 2,5–3 giờ
 ```
@@ -113,5 +159,5 @@ python batdongsan_scraper.py                   # cào toàn bộ: 2,5–3 giờ
 - Dùng Chrome đã cài trên máy (`channel="chrome"`) và **phải hiện cửa sổ**: chế độ headless bị kẹt ở trang "Chờ một chút…" của Cloudflare. Không đóng cửa sổ Chrome trong lúc chạy.
 - Delay 15–30 giây/trang, cứ 40 trang nghỉ 2–4 phút. Bị chặn 3 lần liên tiếp thì dừng hẳn.
 - Tọa độ được bóc từ HTML trang chi tiết (`latitude: …, longitude: …`).
-- Ghi vào bảng `listings` (khác bảng `chotot_listings` của Chợ Tốt).
+- Ghi vào bảng `batdongsan_listings` / `batdongsan_runs` trong cùng database PostgreSQL.
 - Nếu IP đã bị chặn thì phải chờ vài giờ, hoặc đổi mạng (ví dụ phát 4G).

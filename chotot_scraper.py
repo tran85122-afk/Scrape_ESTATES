@@ -3,10 +3,12 @@ nhà mặt phố, nhà phố liền kề, văn phòng, mặt bằng kinh doanh, 
 
 Dùng API JSON công khai mà chính trang nhatot.com gọi: mỗi request trả 50 tin, đã có sẵn
 tọa độ, giá, diện tích, mô tả... -> không cần mở từng trang chi tiết, toàn bộ chỉ ~25 request.
+Dữ liệu lưu vào PostgreSQL (xem db.py), kèm bảng lịch sử để truy ngược mọi thay đổi.
 
 Chạy:
     python chotot_scraper.py              # cào toàn bộ
     python chotot_scraper.py --pages 1    # chạy thử: 1 trang (50 tin) mỗi danh mục
+    python chotot_scraper.py --help       # xem các tùy chọn lọc / giới hạn
 """
 
 import argparse
@@ -14,12 +16,13 @@ import csv
 import json
 import os
 import random
-import sqlite3
 import sys
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+
+from db import init_db, jsonb
 
 API = "https://gateway.chotot.com/v1/public/ad-listing"
 REGION_HANOI = 12000
@@ -35,11 +38,21 @@ QUERIES = [
 # Nhãn suy ra bằng cách lọc theo mã và đọc tiêu đề tin (15/11/2026)
 HOUSE_TYPE = {1: "Nhà mặt phố, mặt tiền", 2: "Nhà biệt thự", 3: "Nhà ngõ, hẻm", 4: "Nhà phố liền kề"}
 COMMERCIAL_TYPE = {1: "Shophouse", 2: "Officetel", 3: "Văn phòng", 4: "Mặt bằng kinh doanh"}
+# Tùy chọn --loai: mỗi loại là một truy vấn riêng tới API (API tự lọc theo house_type / commercial_type)
+TYPES = {
+    "mat-pho": (1020, {"house_type": 1}),
+    "lien-ke": (1020, {"house_type": 4}),
+    "shophouse": (1030, {"commercial_type": 1}),
+    "officetel": (1030, {"commercial_type": 2}),
+    "van-phong": (1030, {"commercial_type": 3}),
+    "mat-bang": (1030, {"commercial_type": 4}),
+}
+# Các cột được theo dõi: đổi giá trị thì ghi một dòng 'thay_doi' vào chotot_history
+TRACKED = ["gia", "gia_text", "dien_tich", "tieu_de", "mo_ta", "loai", "so_phong", "so_tang", "lat", "lng"]
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(HERE, "data")
-DB_PATH = os.path.join(DATA_DIR, "bds.sqlite")
+DATA_DIR = os.path.join(HERE, "data")  # log + bản xuất CSV (dữ liệu chính nằm trong PostgreSQL)
 
 
 def log(msg):
@@ -69,26 +82,8 @@ def fetch(params, retries=3):
             time.sleep(30)
 
 
-def init_db():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    db = sqlite3.connect(DB_PATH)
-    db.executescript("""
-    CREATE TABLE IF NOT EXISTS chotot_listings (
-        list_id INTEGER PRIMARY KEY, ad_id INTEGER, url TEXT, danh_muc TEXT, loai TEXT,
-        tieu_de TEXT, gia INTEGER, gia_text TEXT, dien_tich REAL, so_phong INTEGER, so_tang INTEGER,
-        so_wc INTEGER, mat_duong INTEGER, duong TEXT, phuong TEXT, quan TEXT, tinh TEXT,
-        lat REAL, lng REAL, mo_ta TEXT, anh TEXT, nguoi_dang TEXT, ngay_dang TEXT, raw TEXT,
-        first_seen TEXT, last_seen TEXT, is_active INTEGER DEFAULT 1, removed_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS chotot_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT, finished_at TEXT, status TEXT,
-        n_found INTEGER, n_new INTEGER, n_removed INTEGER
-    );
-    """)
-    return db
-
-
 def row(a, cg):
+    """Chuyển một tin JSON của Chợ Tốt thành một dòng của bảng chotot_listings."""
     lt = a.get("list_time")
     loai = HOUSE_TYPE.get(a.get("house_type")) or COMMERCIAL_TYPE.get(a.get("commercial_type"))
     return {
@@ -112,31 +107,152 @@ def row(a, cg):
         "lat": a.get("latitude"),
         "lng": a.get("longitude"),
         "mo_ta": a.get("body"),
-        "anh": json.dumps(a.get("images") or [], ensure_ascii=False),
+        "anh": a.get("images") or [],
         "nguoi_dang": a.get("account_name"),
-        "ngay_dang": datetime.fromtimestamp(lt / 1000).isoformat(timespec="seconds") if lt else None,
-        "raw": json.dumps(a, ensure_ascii=False),
+        "ngay_dang": datetime.fromtimestamp(lt / 1000).replace(microsecond=0) if lt else None,
+        "raw": a,
     }
 
 
+def query_name(cg, extra):
+    """Tên dễ đọc của một truy vấn, vd 'Nhà ở (Nhà mặt phố, mặt tiền)'."""
+    label = HOUSE_TYPE.get(extra.get("house_type")) or COMMERCIAL_TYPE.get(extra.get("commercial_type"))
+    return CATEGORIES[cg] + (f" ({label})" if label else "")
+
+
+def matches(a, args):
+    """Tin có thỏa các điều kiện lọc --quan, --gia-min/max (triệu/tháng), --dt-min/max (m²) không."""
+    if args.quan:
+        area = (a.get("area_name") or "").lower()
+        if not any(q.lower() in area for q in args.quan):
+            return False
+    price, size = a.get("price"), a.get("size")
+    if args.gia_min is not None and (price is None or price < args.gia_min * 1e6):
+        return False
+    if args.gia_max is not None and (price is None or price > args.gia_max * 1e6):
+        return False
+    if args.dt_min is not None and (size is None or size < args.dt_min):
+        return False
+    if args.dt_max is not None and (size is None or size > args.dt_max):
+        return False
+    return True
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Cào tin cho thuê kinh doanh tại Hà Nội từ Chợ Tốt. Không thêm tùy chọn = cào hết.",
+    )
+    g = ap.add_argument_group("giới hạn cào")
+    g.add_argument("--pages", type=int, default=0, help="chỉ lấy N trang (50 tin/trang) mỗi nhóm, để chạy thử")
+    g.add_argument("--max-tin", type=int, default=0, help="dừng khi đã lưu đủ N tin")
+    f = ap.add_argument_group("giới hạn lọc")
+    f.add_argument("--loai", nargs="+", choices=list(TYPES), help="chỉ lấy các loại này (mặc định: tất cả)")
+    f.add_argument("--quan", nargs="+", help='chỉ lấy tin ở quận/huyện chứa chữ này, vd: --quan "Cầu Giấy" "Đống Đa"')
+    f.add_argument("--gia-min", type=float, help="giá thuê tối thiểu, triệu/tháng")
+    f.add_argument("--gia-max", type=float, help="giá thuê tối đa, triệu/tháng")
+    f.add_argument("--dt-min", type=float, help="diện tích tối thiểu, m²")
+    f.add_argument("--dt-max", type=float, help="diện tích tối đa, m²")
+    ap.add_argument("--min-delay", type=float, default=6, help="nghỉ tối thiểu giữa 2 request, giây")
+    ap.add_argument("--max-delay", type=float, default=12, help="nghỉ tối đa giữa 2 request, giây")
+    return ap.parse_args(argv)
+
+
+def changes(old, new):
+    """So sánh các cột TRACKED giữa bản cũ (trong DB) và bản mới; trả về {cột: [cũ, mới]} cho cột bị đổi."""
+    diff = {}
+    for c in TRACKED:
+        a, b = old.get(c), new.get(c)
+        if isinstance(a, float) or isinstance(b, float):  # 50 và 50.0 là như nhau
+            same = a is not None and b is not None and abs(float(a) - float(b)) < 1e-9 or a is None and b is None
+        else:
+            same = a == b
+        if not same:
+            diff[c] = [a, b]
+    return diff
+
+
+def save_listing(db, r, ts, run_id):
+    """Upsert một tin và ghi lịch sử nếu tin mới / thay đổi / đăng lại. Trả về sự kiện ('moi', ...) hoặc None."""
+    old = db.execute(
+        f"SELECT is_active, {', '.join(TRACKED)} FROM chotot_listings WHERE list_id = %s", (r["list_id"],)
+    ).fetchone()
+    if old is None:
+        event, diff = "moi", None
+    else:
+        old = dict(zip(["is_active", *TRACKED], old))
+        diff = changes(old, r) or None
+        event = "dang_lai" if old["is_active"] == 0 else ("thay_doi" if diff else None)
+
+    values = {**r, "anh": jsonb(r["anh"]), "raw": jsonb(r["raw"])}
+    cols = list(values)
+    upd = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "list_id")
+    db.execute(
+        f"INSERT INTO chotot_listings ({', '.join(cols)}, first_seen, last_seen, is_active, removed_at) "
+        f"VALUES ({', '.join(['%s'] * len(cols))}, %s, %s, 1, NULL) "
+        f"ON CONFLICT (list_id) DO UPDATE SET {upd}, last_seen = EXCLUDED.last_seen, is_active = 1, removed_at = NULL",
+        [*values.values(), ts, ts],
+    )
+    if event:
+        db.execute(
+            "INSERT INTO chotot_history (list_id, run_id, at, su_kien, gia, gia_text, dien_tich, tieu_de, thay_doi, raw) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (r["list_id"], run_id, ts, event, r["gia"], r["gia_text"], r["dien_tich"], r["tieu_de"],
+             jsonb(diff), jsonb(r["raw"])),
+        )  # fmt: skip
+    return event
+
+
+def export_csv(db):
+    """Xuất bảng chotot_listings ra data/chotot_listings.csv (UTF-8 có BOM để Excel đọc đúng tiếng Việt)."""
+    path = os.path.join(DATA_DIR, "chotot_listings.csv")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    cur = db.execute("SELECT * FROM chotot_listings ORDER BY is_active DESC, danh_muc, loai, quan, list_id")
+    names = [c.name for c in cur.description]
+    keep = [i for i, n in enumerate(names) if n != "raw"]
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([names[i] for i in keep])
+        for rec in cur:
+            out = []
+            for i in keep:
+                v = rec[i]
+                if isinstance(v, datetime):
+                    v = v.isoformat(timespec="seconds")
+                elif isinstance(v, (list, dict)):
+                    v = json.dumps(v, ensure_ascii=False)
+                out.append(v)
+            w.writerow(out)
+    return path
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pages", type=int, default=0, help="chỉ lấy N trang mỗi danh mục (chạy thử)")
-    ap.add_argument("--min-delay", type=float, default=6)
-    ap.add_argument("--max-delay", type=float, default=12)
-    args = ap.parse_args()
+    args = parse_args()
+    # Có lọc hoặc giới hạn = chỉ lấy MỘT PHẦN tin -> không được coi tin vắng mặt là "đã gỡ"
+    partial = bool(
+        args.pages
+        or args.max_tin
+        or args.loai
+        or args.quan
+        or any(v is not None for v in (args.gia_min, args.gia_max, args.dt_min, args.dt_max))
+    )
+    queries = [TYPES[t] for t in args.loai] if args.loai else QUERIES
 
     db = init_db()
     run_id = db.execute(
-        "INSERT INTO chotot_runs(started_at, status) VALUES (?, 'running')",
-        (datetime.now().isoformat(timespec="seconds"),),
-    ).lastrowid
+        "INSERT INTO chotot_runs (started_at, status, params) VALUES (%s, 'running', %s) RETURNING id",
+        (datetime.now().replace(microsecond=0), jsonb(vars(args))),
+    ).fetchone()[0]
     db.commit()
-    seen, n_new, status = set(), 0, "done"
+    seen, n_new, n_skip, status = set(), 0, 0, "done"
     complete = True  # lấy đủ số tin API báo? (phòng khi API giới hạn số trang được lật)
+    stop = False  # đã đủ --max-tin
+    if partial:
+        log(f"Chạy có lọc/giới hạn: {vars(args)} -> không kiểm tra tin đã gỡ lần này")
     try:
-        for cg, extra in QUERIES:
-            name = CATEGORIES[cg] + (f" ({HOUSE_TYPE[extra['house_type']]})" if extra else "")
+        for cg, extra in queries:
+            if stop:
+                break
+            name = query_name(cg, extra)
             page, got, total = 0, 0, None
             while True:
                 d = fetch(
@@ -145,68 +261,67 @@ def main():
                 ads = d.get("ads") or []
                 got += len(ads)
                 total = d.get("total", total)
-                ts = datetime.now().isoformat(timespec="seconds")
+                ts = datetime.now().replace(microsecond=0)
                 for a in ads:
+                    if not matches(a, args):
+                        n_skip += 1
+                        continue
                     r = row(a, cg)
                     if r["list_id"] in seen:
                         continue
                     seen.add(r["list_id"])
-                    n_new += not db.execute("SELECT 1 FROM chotot_listings WHERE list_id=?", (r["list_id"],)).fetchone()
-                    cols = list(r) + ["first_seen", "last_seen"]
-                    upd = ", ".join(f"{c}=excluded.{c}" for c in r if c != "list_id")
-                    db.execute(
-                        f"INSERT INTO chotot_listings({','.join(cols)}, is_active, removed_at) "
-                        f"VALUES ({','.join('?' * len(cols))}, 1, NULL) "
-                        f"ON CONFLICT(list_id) DO UPDATE SET {upd}, last_seen=excluded.last_seen, "
-                        f"is_active=1, removed_at=NULL",
-                        [*r.values(), ts, ts],
-                    )
+                    n_new += save_listing(db, r, ts, run_id) == "moi"
+                    if args.max_tin and len(seen) >= args.max_tin:
+                        stop = True
+                        break
                 db.commit()
                 page += 1
                 log(f"{name}: trang {page}, {len(ads)} tin (tổng API báo {d.get('total')}) | đã có {len(seen)}")
+                if stop:
+                    log(f"  Đã đủ {args.max_tin} tin (--max-tin) -> dừng")
+                    break
                 time.sleep(random.uniform(args.min_delay, args.max_delay))
                 if len(ads) < PAGE_SIZE or (args.pages and page >= args.pages):
                     break
             # Tin mới có thể được đăng giữa lúc lật trang nên cho lệch 2%
-            if not args.pages and total and got < total * 0.98:
+            if not partial and total and got < total * 0.98:
                 complete = False
                 log(f"  CẢNH BÁO: {name} chỉ lấy được {got}/{total} tin -> không đánh dấu tin đã gỡ lần này")
     except Exception as e:
+        db.rollback()  # bỏ phần dở dang của trang đang ghi; các trang trước đã commit vẫn còn
         status = f"failed: {e}"
         log(status)
 
-    # Chỉ đánh dấu "đã mất" khi lần chạy trọn vẹn: không lỗi, không phải chạy thử, lấy đủ tin.
-    # Lần chạy thử ghi n_removed = NULL để app.py không lấy nó làm mốc cho bộ lọc "tin mới".
-    full_run = status == "done" and not args.pages and complete and bool(seen)
+    # Chỉ đánh dấu "đã mất" khi lần chạy trọn vẹn: không lỗi, không lọc/giới hạn/chạy thử, lấy đủ tin.
+    # Lần không trọn vẹn ghi n_removed = NULL để app.py không lấy nó làm mốc cho bộ lọc "tin mới".
+    full_run = status == "done" and not partial and complete and bool(seen)
     n_removed = None
     if full_run:
-        ts = datetime.now().isoformat(timespec="seconds")
-        db.execute("CREATE TEMP TABLE seen_ids(id INTEGER PRIMARY KEY)")
-        db.executemany("INSERT INTO seen_ids VALUES (?)", [(i,) for i in seen])
-        n_removed = db.execute(
-            "UPDATE chotot_listings SET is_active=0, removed_at=? "
-            "WHERE is_active=1 AND list_id NOT IN (SELECT id FROM seen_ids)",
-            (ts,),
-        ).rowcount
+        ts = datetime.now().replace(microsecond=0)
+        removed = db.execute(
+            "UPDATE chotot_listings SET is_active = 0, removed_at = %s "
+            "WHERE is_active = 1 AND NOT (list_id = ANY(%s)) RETURNING list_id, gia, gia_text, dien_tich, tieu_de",
+            (ts, list(seen)),
+        ).fetchall()
+        for list_id, gia, gia_text, dien_tich, tieu_de in removed:
+            db.execute(
+                "INSERT INTO chotot_history (list_id, run_id, at, su_kien, gia, gia_text, dien_tich, tieu_de) "
+                "VALUES (%s, %s, %s, 'go', %s, %s, %s, %s)",
+                (list_id, run_id, ts, gia, gia_text, dien_tich, tieu_de),
+            )
+        n_removed = len(removed)
     db.execute(
-        "UPDATE chotot_runs SET finished_at=?, status=?, n_found=?, n_new=?, n_removed=? WHERE id=?",
-        (datetime.now().isoformat(timespec="seconds"), status, len(seen), n_new, n_removed, run_id),
+        "UPDATE chotot_runs SET finished_at = %s, status = %s, n_found = %s, n_new = %s, n_removed = %s WHERE id = %s",
+        (datetime.now().replace(microsecond=0), status, len(seen), n_new, n_removed, run_id),
     )
     db.commit()
     log(
         f"Xong: {status} | tìm thấy {len(seen)} | mới {n_new} | "
         f"đã mất {n_removed if full_run else '– (không kiểm tra lần này)'}"
+        + (f" | bỏ qua {n_skip} tin không khớp bộ lọc" if n_skip else "")
     )
-
-    path = os.path.join(DATA_DIR, "chotot_listings.csv")
-    cur = db.execute("SELECT * FROM chotot_listings ORDER BY is_active DESC, danh_muc, loai, quan")
-    cols = [c[0] for c in cur.description if c[0] != "raw"]
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(cols)
-        for rec in cur:
-            w.writerow([v for c, v in zip([c[0] for c in cur.description], rec) if c != "raw"])
-    log(f"Đã xuất {path}")
+    log(f"Đã xuất {export_csv(db)}")
+    db.close()
 
 
 if __name__ == "__main__":
